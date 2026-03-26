@@ -149,22 +149,51 @@ def postProcess(xmin, xmax, ymin, ymax, field_pinn,
     plt.show()
 
 
-def plot_loss_components(loss_total, loss_pde, loss_wall,
-                         loss_inlet, loss_outlet, n_adam):
-    """Semilogy plot of all loss components with Adam/L-BFGS boundary marker."""
-    fig, ax = plt.subplots(figsize=(8, 5))
-    iters = np.arange(len(loss_total))
-    ax.semilogy(iters, loss_total,  'k-',  lw=1.5, label='Total')
-    ax.semilogy(iters, loss_pde,    'b--', lw=1.2, label='PDE')
-    ax.semilogy(iters, loss_wall,   'g:',  lw=1.2, label='Wall BC')
-    ax.semilogy(iters, loss_inlet,  'm:',  lw=1.2, label='Inlet BC')
-    ax.semilogy(iters, loss_outlet, 'c:',  lw=1.2, label='Outlet BC')
-    if n_adam > 0 and n_adam < len(loss_total):
-        ax.axvline(n_adam, color='r', ls='--', lw=1.5, label='Adam → L-BFGS')
-    ax.set_xlabel('Iteration'); ax.set_ylabel('Loss')
-    ax.set_title('Loss Convergence (Adam + L-BFGS-B)')
-    ax.legend(fontsize=9); ax.grid(True, which='both', ls='--', alpha=0.4)
-    plt.tight_layout(); plt.show()
+def plot_loss_all(model, n_adam=0):
+    """Two-panel semilogy plot showing every individual loss component.
+
+    Left panel  : PDE residuals (f_u, f_v, f_s11, f_s22, f_s12, f_p) + total
+    Right panel : Boundary conditions (wall, inlet, outlet) + total
+
+    Parameters
+    ----------
+    model  : trained PINN_beam_flow_TF2 instance
+    n_adam : iteration index where Adam ended (draws a dashed vertical line)
+    """
+    iters = np.arange(len(model.loss_total))
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # ── PDE terms ──────────────────────────────────────────────
+    ax1.semilogy(iters, model.loss_total,  'k-',   lw=2.0, label='Total (weighted)')
+    ax1.semilogy(iters, model.loss_fu,     'b-',   lw=1.2, label=r'$f_u$ (momentum x)')
+    ax1.semilogy(iters, model.loss_fv,     'r-',   lw=1.2, label=r'$f_v$ (momentum y)')
+    ax1.semilogy(iters, model.loss_fs11,   'b--',  lw=1.0, label=r'$f_{s_{11}}$ (constitutive)')
+    ax1.semilogy(iters, model.loss_fs22,   'r--',  lw=1.0, label=r'$f_{s_{22}}$ (constitutive)')
+    ax1.semilogy(iters, model.loss_fs12,   'm--',  lw=1.0, label=r'$f_{s_{12}}$ (shear)')
+    ax1.semilogy(iters, model.loss_fp,     'g--',  lw=1.0, label=r'$f_p$ (trace/pressure)')
+    if 0 < n_adam < len(iters):
+        ax1.axvline(n_adam, color='grey', ls='--', lw=1.2, label='Adam → L-BFGS')
+    ax1.set_xlabel('Iteration'); ax1.set_ylabel('Unweighted MSE')
+    ax1.set_title('PDE Residuals')
+    ax1.legend(fontsize=8, loc='upper right')
+    ax1.grid(True, which='both', ls='--', alpha=0.35)
+
+    # ── BC terms ───────────────────────────────────────────────
+    ax2.semilogy(iters, model.loss_total,  'k-',   lw=2.0, label='Total (weighted)')
+    ax2.semilogy(iters, model.loss_wall,   'g-',   lw=1.2, label='Wall (no-slip)')
+    ax2.semilogy(iters, model.loss_inlet,  'b-',   lw=1.2, label='Inlet (velocity)')
+    ax2.semilogy(iters, model.loss_outlet, 'r-',   lw=1.2, label='Outlet (pressure)')
+    if 0 < n_adam < len(iters):
+        ax2.axvline(n_adam, color='grey', ls='--', lw=1.2, label='Adam → L-BFGS')
+    ax2.set_xlabel('Iteration'); ax2.set_ylabel('Unweighted MSE')
+    ax2.set_title('Boundary Condition Residuals')
+    ax2.legend(fontsize=8, loc='upper right')
+    ax2.grid(True, which='both', ls='--', alpha=0.35)
+
+    fig.suptitle('Loss Convergence — Cylinder + Beam PINN', fontsize=12)
+    plt.tight_layout()
+    plt.show()
 
 
 # ============================================================
@@ -197,29 +226,56 @@ class MLP(tf.keras.Model):
 # PINN class — cylinder + beam geometry
 # ============================================================
 
+# Default loss weights — can be overridden per-term via the `weights` argument.
+# Keys: w_fu, w_fv, w_fs11, w_fs22, w_fs12, w_fp  (PDE residuals)
+#        w_wall, w_inlet, w_outlet                  (boundary conditions)
+DEFAULT_WEIGHTS = {
+    'w_fu':     1.0,   # x-momentum residual
+    'w_fv':     1.0,   # y-momentum residual
+    'w_fs11':   1.0,   # constitutive: normal stress 11
+    'w_fs22':   1.0,   # constitutive: normal stress 22
+    'w_fs12':   1.0,   # constitutive: shear stress 12
+    'w_fp':     1.0,   # trace / pressure-recovery constraint
+    'w_wall':  10.0,   # no-slip BC (cylinder + beam + channel walls)
+    'w_inlet': 10.0,   # prescribed inlet velocity
+    'w_outlet': 10.0,  # zero mean pressure at outlet
+}
+
+
 class PINN_beam_flow_TF2:
     """Mixed-form PINN for steady laminar flow past cylinder + rigid beam.
 
     Network outputs (5 values): ψ, p, s11, s22, s12
       u = ∂ψ/∂y,   v = -∂ψ/∂x
     PDE residuals (Turek-Hron CFD benchmark, steady):
-      f_u  = ρ(u u_x + v u_y) - s11_x - s12_y
-      f_v  = ρ(u v_x + v v_y) - s12_x - s22_y
+      f_u   = ρ(u u_x + v u_y) - s11_x - s12_y
+      f_v   = ρ(u v_x + v v_y) - s12_x - s22_y
       f_s11 = -p + 2μ u_x - s11
       f_s22 = -p + 2μ v_y - s22
       f_s12 = μ(u_y + v_x) - s12
       f_p   = p + ½(s11 + s22)   [trace / pressure recovery]
+
+    Each loss term has its own scalar weight set via the `weights` dict.
+    All weights default to DEFAULT_WEIGHTS and can be partially overridden:
+
+        model = PINN_beam_flow_TF2(..., weights={'w_fu': 5.0, 'w_wall': 20.0})
     """
 
     def __init__(self, Collo, INLET, OUTLET, WALL,
                  uv_layers, lb, ub,
-                 rho=1.0, mu=0.02, bc_weight=10.0):
+                 rho=1.0, mu=0.02, weights=None):
         self.lb = lb.astype(np.float32).reshape(1, 2)
         self.ub = ub.astype(np.float32).reshape(1, 2)
 
-        self.rho       = tf.constant(rho,       dtype=tf.float32)
-        self.mu        = tf.constant(mu,        dtype=tf.float32)
-        self.bc_weight = tf.constant(bc_weight, dtype=tf.float32)
+        self.rho = tf.constant(rho, dtype=tf.float32)
+        self.mu  = tf.constant(mu,  dtype=tf.float32)
+
+        # Merge user-supplied weights with defaults
+        w = dict(DEFAULT_WEIGHTS)
+        if weights is not None:
+            w.update(weights)
+        self.w = {k: tf.constant(float(v), dtype=tf.float32) for k, v in w.items()}
+        self._weights_dict = w   # keep a plain-Python copy for inspection / saving
 
         self.Collo  = Collo.astype(np.float32)
         self.INLET  = INLET.astype(np.float32)   # columns: x, y, u_ref, v_ref
@@ -230,12 +286,19 @@ class PINN_beam_flow_TF2:
         out_dim       = uv_layers[-1]  # must be 5
         self.net = MLP(hidden_widths + [out_dim], activation='tanh')
 
-        # Loss history — all lists initialised here, never reset mid-run
-        self.loss_total  = []
-        self.loss_pde    = []
-        self.loss_wall   = []
-        self.loss_inlet  = []
-        self.loss_outlet = []
+        # ── Loss history — all lists initialised here, never reset mid-run ──
+        # Unweighted raw MSE for each term (useful for diagnosing convergence)
+        self.loss_fu     = []   # MSE(f_u)
+        self.loss_fv     = []   # MSE(f_v)
+        self.loss_fs11   = []   # MSE(f_s11)
+        self.loss_fs22   = []   # MSE(f_s22)
+        self.loss_fs12   = []   # MSE(f_s12)
+        self.loss_fp     = []   # MSE(f_p)
+        self.loss_pde    = []   # unweighted sum: Σ MSE(f_i)
+        self.loss_wall   = []   # unweighted MSE(u_wall, v_wall)
+        self.loss_inlet  = []   # unweighted MSE(u_in − u_ref, v_in − v_ref)
+        self.loss_outlet = []   # unweighted (mean p_out)²
+        self.loss_total  = []   # weighted total (what the optimiser minimises)
 
     # ----------------------------------------------------------
     def net_psips(self, x, y):
@@ -280,31 +343,46 @@ class PINN_beam_flow_TF2:
 
     # ----------------------------------------------------------
     def loss_fn(self, Xc, WALL, INLET, OUTLET):
-        """Composite loss: PDE residuals + weighted boundary conditions."""
-        # PDE residuals on collocation points
+        """Composite loss with per-term weights.
+
+        Returns
+        -------
+        total : weighted scalar loss (optimiser target)
+        lfu, lfv, lfs11, lfs22, lfs12, lfp : unweighted MSE of each PDE residual
+        lwall, lin, lout : unweighted MSE of each boundary condition
+        """
+        mse = lambda t: tf.reduce_mean(tf.square(t))
+        w   = self.w
+
+        # ── PDE residuals ──────────────────────────────────────
         xc, yc = Xc[:, 0:1], Xc[:, 1:2]
         fu, fv, fs11, fs22, fs12, fp = self.residuals(xc, yc)
-        mse = lambda t: tf.reduce_mean(tf.square(t))
-        loss_f = mse(fu) + mse(fv) + mse(fs11) + mse(fs22) + mse(fs12) + mse(fp)
+        lfu   = mse(fu);   lfv   = mse(fv)
+        lfs11 = mse(fs11); lfs22 = mse(fs22)
+        lfs12 = mse(fs12); lfp   = mse(fp)
 
-        # No-slip on cylinder, beam, and channel walls
+        loss_pde = (w['w_fu']  * lfu  + w['w_fv']   * lfv  +
+                    w['w_fs11']* lfs11+ w['w_fs22']  * lfs22+
+                    w['w_fs12']* lfs12+ w['w_fp']    * lfp)
+
+        # ── Wall no-slip ────────────────────────────────────────
         xw, yw = WALL[:, 0:1], WALL[:, 1:2]
         u_w, v_w, *_ = self.uv_and_grads(xw, yw)
-        loss_wall = mse(u_w) + mse(v_w)
+        lwall = mse(u_w) + mse(v_w)
 
-        # Prescribed inlet velocity (parabolic)
+        # ── Inlet velocity ──────────────────────────────────────
         xi, yi = INLET[:, 0:1], INLET[:, 1:2]
         ui, vi = INLET[:, 2:3], INLET[:, 3:4]
         u_i, v_i, *_ = self.uv_and_grads(xi, yi)
-        loss_in = mse(u_i - ui) + mse(v_i - vi)
+        lin = mse(u_i - ui) + mse(v_i - vi)
 
-        # Zero mean pressure at outlet
+        # ── Outlet pressure ─────────────────────────────────────
         xo, yo = OUTLET[:, 0:1], OUTLET[:, 1:2]
         _, p_o, _, _, _ = self.net_psips(xo, yo)
-        loss_out = tf.square(tf.reduce_mean(p_o))
+        lout = tf.square(tf.reduce_mean(p_o))
 
-        total = loss_f + self.bc_weight * (loss_wall + loss_in + loss_out)
-        return total, loss_f, loss_wall, loss_in, loss_out
+        total = loss_pde + w['w_wall']*lwall + w['w_inlet']*lin + w['w_outlet']*lout
+        return total, lfu, lfv, lfs11, lfs22, lfs12, lfp, lwall, lin, lout
 
     # ----------------------------------------------------------
     def _to_tf(self):
@@ -314,12 +392,30 @@ class PINN_beam_flow_TF2:
                 tf.constant(self.INLET,  dtype=tf.float32),
                 tf.constant(self.OUTLET, dtype=tf.float32))
 
-    def _record(self, total, lf, lw, lin, lout):
+    def _record(self, total, lfu, lfv, lfs11, lfs22, lfs12, lfp, lwall, lin, lout):
         self.loss_total.append(float(total))
-        self.loss_pde.append(float(lf))
-        self.loss_wall.append(float(lw))
+        self.loss_fu.append(float(lfu));     self.loss_fv.append(float(lfv))
+        self.loss_fs11.append(float(lfs11)); self.loss_fs22.append(float(lfs22))
+        self.loss_fs12.append(float(lfs12)); self.loss_fp.append(float(lfp))
+        self.loss_pde.append(float(lfu) + float(lfv) + float(lfs11) +
+                             float(lfs22) + float(lfs12) + float(lfp))
+        self.loss_wall.append(float(lwall))
         self.loss_inlet.append(float(lin))
         self.loss_outlet.append(float(lout))
+
+    # ----------------------------------------------------------
+    def print_weights(self):
+        """Print the current loss weights in a readable table."""
+        print("Loss weights:")
+        print(f"  PDE  — w_fu={self._weights_dict['w_fu']:.2g}  "
+              f"w_fv={self._weights_dict['w_fv']:.2g}  "
+              f"w_fs11={self._weights_dict['w_fs11']:.2g}  "
+              f"w_fs22={self._weights_dict['w_fs22']:.2g}  "
+              f"w_fs12={self._weights_dict['w_fs12']:.2g}  "
+              f"w_fp={self._weights_dict['w_fp']:.2g}")
+        print(f"  BC   — w_wall={self._weights_dict['w_wall']:.2g}  "
+              f"w_inlet={self._weights_dict['w_inlet']:.2g}  "
+              f"w_outlet={self._weights_dict['w_outlet']:.2g}")
 
     # ----------------------------------------------------------
     def train_adam(self, iters=10000, lr=5e-4, print_every=200):
@@ -329,15 +425,19 @@ class PINN_beam_flow_TF2:
 
         for it in range(iters):
             with tf.GradientTape() as tape:
-                loss, lf, lw, lin, lout = self.loss_fn(Xc, WALL, INLET, OUTLET)
-            grads = tape.gradient(loss, self.net.trainable_variables)
+                ret = self.loss_fn(Xc, WALL, INLET, OUTLET)
+            total = ret[0]
+            grads = tape.gradient(total, self.net.trainable_variables)
             opt.apply_gradients(zip(grads, self.net.trainable_variables))
-            self._record(loss.numpy(), lf.numpy(), lw.numpy(),
-                         lin.numpy(), lout.numpy())
+            self._record(*[v.numpy() for v in ret])
             if it % print_every == 0:
-                print(f"Adam {it:6d}/{iters} | total={loss.numpy():.3e} "
-                      f"pde={lf.numpy():.3e} wall={lw.numpy():.3e} "
-                      f"in={lin.numpy():.3e} out={lout.numpy():.3e}")
+                lfu, lfv, lfs11, lfs22, lfs12, lfp, lwall, lin, lout = \
+                    [v.numpy() for v in ret[1:]]
+                print(f"Adam {it:6d}/{iters} | total={total.numpy():.3e} | "
+                      f"fu={lfu:.2e} fv={lfv:.2e} "
+                      f"fs11={lfs11:.2e} fs22={lfs22:.2e} "
+                      f"fs12={lfs12:.2e} fp={lfp:.2e} | "
+                      f"wall={lwall:.2e} in={lin:.2e} out={lout:.2e}")
 
     # ----------------------------------------------------------
     def train_lbfgs(self, maxiter=50000, maxcor=50):
@@ -359,7 +459,8 @@ class PINN_beam_flow_TF2:
         def loss_and_grad(flat):
             unpack(flat)
             with tf.GradientTape() as tape:
-                total, *_ = self.loss_fn(Xc, WALL, INLET, OUTLET)
+                ret = self.loss_fn(Xc, WALL, INLET, OUTLET)
+            total = ret[0]
             grads = tape.gradient(total, self.net.trainable_variables)
             g_flat = np.concatenate(
                 [g.numpy().ravel() for g in grads]
@@ -367,10 +468,11 @@ class PINN_beam_flow_TF2:
             return float(total.numpy()), g_flat
 
         def callback(xk):
-            total, lf, lw, lin, lout = self.loss_fn(Xc, WALL, INLET, OUTLET)
-            self._record(total.numpy(), lf.numpy(), lw.numpy(),
-                         lin.numpy(), lout.numpy())
-            print(f"  L-BFGS | total={float(total):.3e} pde={float(lf):.3e}")
+            ret = self.loss_fn(Xc, WALL, INLET, OUTLET)
+            self._record(*[v.numpy() for v in ret])
+            total, lfu, lfv = ret[0], ret[1], ret[2]
+            print(f"  L-BFGS | total={float(total):.3e} "
+                  f"fu={float(lfu):.2e} fv={float(lfv):.2e}")
 
         res = scipy.optimize.minimize(
             fun=loss_and_grad, x0=pack(), jac=True,
@@ -560,11 +662,26 @@ def main():
     uv_layers = [2] + 8 * [40] + [5]
     XY_c, INLET, OUTLET, WALL, lb, ub, geom = build_problem(Ubar=Ubar)
 
+    # ---- Weight configuration (Strategy: momentum-heavy, constitutive-light) ----
+    # See weighting strategy notes in the notebook for alternatives.
+    weights = {
+        'w_fu':    2.0,   # momentum harder to satisfy → boost
+        'w_fv':    2.0,
+        'w_fs11':  0.5,   # constitutive eqs are algebraic → relax
+        'w_fs22':  0.5,
+        'w_fs12':  0.5,
+        'w_fp':    1.0,
+        'w_wall':  10.0,
+        'w_inlet': 10.0,
+        'w_outlet': 5.0,
+    }
+
     # ---- Training ----
     model = PINN_beam_flow_TF2(
         XY_c, INLET, OUTLET, WALL, uv_layers, lb, ub,
-        rho=rho, mu=mu, bc_weight=10.0
+        rho=rho, mu=mu, weights=weights
     )
+    model.print_weights()
 
     print("=== Adam optimisation ===")
     t0 = time.time()
@@ -578,8 +695,7 @@ def main():
     model.save('uvNN_beam_weights.weights.h5')
 
     # ---- Loss plot ----
-    plot_loss_components(model.loss_total, model.loss_pde, model.loss_wall,
-                         model.loss_inlet, model.loss_outlet, n_adam)
+    plot_loss_all(model, n_adam=n_adam)
 
     # ---- Field visualisation ----
     xc, yc, r, xb0, xb1, yb0, yb1 = geom
@@ -604,17 +720,21 @@ def main():
 
     # ---- Save results ----
     results = {
-        'loss_total':   model.loss_total,
-        'loss_pde':     model.loss_pde,
-        'loss_wall':    model.loss_wall,
-        'loss_inlet':   model.loss_inlet,
-        'loss_outlet':  model.loss_outlet,
+        'loss_total':  model.loss_total,
+        'loss_fu':     model.loss_fu,    'loss_fv':    model.loss_fv,
+        'loss_fs11':   model.loss_fs11,  'loss_fs22':  model.loss_fs22,
+        'loss_fs12':   model.loss_fs12,  'loss_fp':    model.loss_fp,
+        'loss_pde':    model.loss_pde,
+        'loss_wall':   model.loss_wall,
+        'loss_inlet':  model.loss_inlet,
+        'loss_outlet': model.loss_outlet,
         'u_pred': u_p, 'v_pred': v_p, 'p_pred': p_p,
         'x_eval': x_ev, 'y_eval': y_ev,
         'drag': D, 'lift': L_f, 'Cd': Cd, 'Cl': Cl,
         'meta': {
             'rho': rho, 'mu': mu, 'Ubar': Ubar,
-            'bc_weight': 10.0, 'layers': uv_layers,
+            'weights': model._weights_dict,
+            'layers': uv_layers,
             'description': 'Steady cylinder+beam PINN (Turek-Hron CFD1)'
         }
     }
